@@ -150,3 +150,11 @@ button.ghost { background: transparent; border: 1px solid var(--line); color: va
   max-width: 360px;
   margin: 80px auto;
 }
+
+.help-list {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: grid;
+  gap: 10px;
+  line-height: 1.45;
+}

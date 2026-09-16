@@ -2,7 +2,7 @@ import {useEffect, useMemo, useState} from 'react';
 import type {SupabaseClient} from '@supabase/supabase-js';
 import {createOpsClient, OPS_PIN} from './supabase';
 
-type Tab = 'locations' | 'users' | 'attendance' | 'failures' | 'tests';
+type Tab = 'overview' | 'locations' | 'users' | 'attendance' | 'tests';
 
 type LocationRow = {
   id: string;
@@ -42,10 +42,14 @@ function plainTime(iso: string | null): string {
   }
 }
 
+function isValidHm(value: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value.trim());
+}
+
 export default function App() {
   const [unlocked, setUnlocked] = useState(false);
   const [pin, setPin] = useState('');
-  const [tab, setTab] = useState<Tab>('locations');
+  const [tab, setTab] = useState<Tab>('overview');
   const [client, setClient] = useState<SupabaseClient | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -59,6 +63,11 @@ export default function App() {
       setError((e as Error).message);
     }
   }, [unlocked]);
+
+  useEffect(() => {
+    setNotice(null);
+    setError(null);
+  }, [tab]);
 
   if (!unlocked) {
     return (
@@ -99,11 +108,11 @@ export default function App() {
       <div className="tabs">
         {(
           [
+            ['overview', 'Overview'],
             ['locations', 'Locations'],
             ['users', 'Users & shifts'],
             ['attendance', 'Attendance'],
-            ['failures', 'Failure log'],
-            ['tests', 'Tests'],
+            ['tests', 'Test checklist'],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -115,6 +124,7 @@ export default function App() {
         ))}
       </div>
 
+      {tab === 'overview' ? <OverviewPanel onGo={setTab} /> : null}
       {client && tab === 'locations' ? (
         <LocationsPanel client={client} onError={setError} onNotice={setNotice} />
       ) : null}
@@ -124,8 +134,46 @@ export default function App() {
       {client && tab === 'attendance' ? (
         <AttendancePanel client={client} onError={setError} />
       ) : null}
-      {tab === 'failures' ? <FailuresPanel /> : null}
       {tab === 'tests' ? <TestsPanel /> : null}
+    </div>
+  );
+}
+
+function OverviewPanel({onGo}: {onGo: (tab: Tab) => void}) {
+  return (
+    <div className="card">
+      <h2>What you can do here</h2>
+      <ol className="help-list">
+        <li>
+          <strong>Locations</strong> — change GPS coordinates, radius, and Wi‑Fi SSID for a site
+          without editing the database.
+        </li>
+        <li>
+          <strong>Users & shifts</strong> — add demo users (`user-1`, `user-2`, …) and assign daily
+          shifts to a location/timezone.
+        </li>
+        <li>
+          <strong>Attendance</strong> — see who is clocked in / out in plain English.
+        </li>
+        <li>
+          <strong>Test checklist</strong> — step-by-step scenarios for the mobile app.
+        </li>
+      </ol>
+      <p className="muted">
+        This dashboard is for the client demo (mock auth). Use the same user id in the app after OTP
+        (any 6-digit code in demo builds).
+      </p>
+      <div className="row" style={{marginTop: 12}}>
+        <button className="primary" onClick={() => onGo('locations')}>
+          Edit locations
+        </button>
+        <button className="ghost" onClick={() => onGo('users')}>
+          Assign shifts
+        </button>
+        <button className="ghost" onClick={() => onGo('attendance')}>
+          View attendance
+        </button>
+      </div>
     </div>
   );
 }
@@ -141,6 +189,7 @@ function LocationsPanel({
 }) {
   const [rows, setRows] = useState<LocationRow[]>([]);
   const [editing, setEditing] = useState<LocationRow | null>(null);
+  const [busy, setBusy] = useState(false);
 
   async function load() {
     const {data, error} = await client
@@ -148,7 +197,7 @@ function LocationsPanel({
       .select('id,name,latitude,longitude,radius,wifi_ssid,timezone')
       .order('name');
     if (error) {
-      onError(error.message);
+      onError(`Could not load locations: ${error.message}`);
       return;
     }
     onError(null);
@@ -161,27 +210,42 @@ function LocationsPanel({
 
   async function save() {
     if (!editing) return;
-    const {error} = await client.from('locations').upsert({
-      id: editing.id,
-      name: editing.name,
-      latitude: Number(editing.latitude),
-      longitude: Number(editing.longitude),
-      radius: Number(editing.radius ?? 200),
-      wifi_ssid: editing.wifi_ssid,
-      timezone: editing.timezone || 'Asia/Karachi',
-    });
+    setBusy(true);
+    const {data, error} = await client
+      .from('locations')
+      .update({
+        name: editing.name,
+        latitude: Number(editing.latitude),
+        longitude: Number(editing.longitude),
+        radius: Number(editing.radius ?? 200),
+        wifi_ssid: editing.wifi_ssid,
+        timezone: editing.timezone || 'Asia/Karachi',
+      })
+      .eq('id', editing.id)
+      .select('id,name')
+      .maybeSingle();
+    setBusy(false);
     if (error) {
-      onError(error.message);
+      onError(`Save failed: ${error.message}`);
       return;
     }
-    onNotice(`Saved location “${editing.name}”.`);
+    if (!data) {
+      onError('Save failed: no row updated (check location id / permissions).');
+      return;
+    }
+    onNotice(`Saved location “${editing.name}”. Pull-to-refresh schedules in the app.`);
     setEditing(null);
     await load();
   }
 
   return (
     <div className="card">
-      <h2>Locations (GPS / Wi‑Fi)</h2>
+      <div className="row" style={{justifyContent: 'space-between'}}>
+        <h2 style={{margin: 0}}>Locations (GPS / Wi‑Fi)</h2>
+        <button className="ghost" onClick={() => void load()}>
+          Refresh
+        </button>
+      </div>
       <p className="muted">
         Change site coordinates here instead of editing the database by hand.
       </p>
@@ -201,6 +265,7 @@ function LocationsPanel({
               <td>
                 <strong>{row.name}</strong>
                 <div className="muted">{row.id}</div>
+                <div className="muted">{row.timezone || '—'}</div>
               </td>
               <td>
                 {row.latitude}, {row.longitude}
@@ -229,10 +294,11 @@ function LocationsPanel({
               />
             </label>
             <label>
-              Timezone
+              Timezone (IANA)
               <input
                 value={editing.timezone || ''}
                 onChange={e => setEditing({...editing, timezone: e.target.value})}
+                placeholder="Asia/Karachi"
               />
             </label>
             <label>
@@ -270,8 +336,8 @@ function LocationsPanel({
             </label>
           </div>
           <div className="row" style={{marginTop: 12}}>
-            <button className="primary" onClick={() => void save()}>
-              Save location
+            <button className="primary" disabled={busy} onClick={() => void save()}>
+              {busy ? 'Saving…' : 'Save location'}
             </button>
             <button className="ghost" onClick={() => setEditing(null)}>
               Cancel
@@ -302,6 +368,7 @@ function UsersShiftsPanel({
   const [startLocal, setStartLocal] = useState('17:00');
   const [endLocal, setEndLocal] = useState('21:00');
   const [days, setDays] = useState(7);
+  const [busy, setBusy] = useState(false);
 
   async function load() {
     const [u, l, s] = await Promise.all([
@@ -318,10 +385,17 @@ function UsersShiftsPanel({
       return;
     }
     onError(null);
-    setUsers((u.data as UserRow[]) || []);
-    setLocations((l.data as LocationRow[]) || []);
+    const userRows = (u.data as UserRow[]) || [];
+    const locRows = (l.data as LocationRow[]) || [];
+    setUsers(userRows);
+    setLocations(locRows);
     setSchedules((s.data as ScheduleRow[]) || []);
-    if (!assignLocation && l.data?.[0]) setAssignLocation((l.data[0] as LocationRow).id);
+    if (userRows.length && !userRows.some(x => x.id === assignUser)) {
+      setAssignUser(userRows[0].id);
+    }
+    if (locRows.length && !locRows.some(x => x.id === assignLocation)) {
+      setAssignLocation(locRows[0].id);
+    }
   }
 
   useEffect(() => {
@@ -331,12 +405,17 @@ function UsersShiftsPanel({
   async function addUser() {
     const id = newUserId.trim();
     if (!id) return;
+    setBusy(true);
     const {error} = await client.from('users').upsert({id, phone: newPhone.trim() || null});
+    setBusy(false);
     if (error) {
-      onError(error.message);
+      onError(`Could not save user: ${error.message}`);
       return;
     }
-    onNotice(`User “${id}” ready. Use this same id when logging into the app (mock auth demo).`);
+    onNotice(
+      `User “${id}” ready. In the demo app, log in and use this same user mapping (Dev / user-1 style demo).`,
+    );
+    setAssignUser(id);
     await load();
   }
 
@@ -344,12 +423,24 @@ function UsersShiftsPanel({
     const loc = locations.find(l => l.id === assignLocation);
     const tz = loc?.timezone || 'Asia/Karachi';
     const userId = assignUser.trim();
-    if (!userId || !assignLocation) return;
+    if (!userId || !assignLocation) {
+      onError('Pick a user and location first.');
+      return;
+    }
+    if (!isValidHm(startLocal) || !isValidHm(endLocal)) {
+      onError('Start/end must be HH:MM (24h), e.g. 17:00');
+      return;
+    }
+    if (days < 1 || days > 28) {
+      onError('Days ahead must be between 1 and 28.');
+      return;
+    }
 
-    // Replace upcoming window for this user so demo stays clean.
+    setBusy(true);
     const {error: delErr} = await client.from('schedules').delete().eq('user_id', userId);
     if (delErr) {
-      onError(delErr.message);
+      setBusy(false);
+      onError(`Could not clear old schedules: ${delErr.message}`);
       return;
     }
 
@@ -357,34 +448,38 @@ function UsersShiftsPanel({
       [];
     const now = new Date();
     for (let i = 0; i < days; i++) {
-      const day = new Date(now);
-      day.setDate(now.getDate() + i);
-      const y = day.getFullYear();
-      const m = String(day.getMonth() + 1).padStart(2, '0');
-      const d = String(day.getDate()).padStart(2, '0');
-      // Interpret wall times in the site timezone via Postgres timestamptz cast pattern:
-      // store as ISO by constructing Date in local browser — for ops demos we send UTC ISO
-      // built from "local wall clock assumed as site TZ offset" is fragile.
-      // Prefer SQL via RPC later; for v1 use ISO with explicit Z and document TZ separately.
-      const startIso = wallToApproxIso(`${y}-${m}-${d}`, startLocal, tz);
-      const endIso = wallToApproxIso(`${y}-${m}-${d}`, endLocal, tz);
+      const day = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() + i));
+      // Use calendar date in site TZ by formatting with Intl
+      const dayKey = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date(now.getTime() + i * 24 * 60 * 60 * 1000));
+      const startIso = wallToApproxIso(dayKey, startLocal.trim(), tz);
+      const endIso = wallToApproxIso(dayKey, endLocal.trim(), tz);
+      if (Number.isNaN(Date.parse(startIso)) || Number.isNaN(Date.parse(endIso))) {
+        setBusy(false);
+        onError(`Invalid time conversion for ${dayKey} (${tz}).`);
+        return;
+      }
       rows.push({
         user_id: userId,
         location_id: assignLocation,
         start_time: startIso,
         end_time: endIso,
       });
+      void day;
     }
 
-    const {error} = await client.from('schedules').insert(rows);
+    const {data, error} = await client.from('schedules').insert(rows).select('id');
+    setBusy(false);
     if (error) {
-      onError(
-        `${error.message}. If inserts are blocked by RLS, apply an ops write policy or use the SQL seed scripts.`,
-      );
+      onError(`Could not assign shifts: ${error.message}`);
       return;
     }
     onNotice(
-      `Assigned ${days} day(s) for ${userId} at ${assignLocation} (${startLocal}–${endLocal} ${tz}).`,
+      `Assigned ${data?.length ?? rows.length} day(s) for ${userId} at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz}). Refresh the app schedule.`,
     );
     await load();
   }
@@ -404,7 +499,7 @@ function UsersShiftsPanel({
           </label>
         </div>
         <div className="row" style={{marginTop: 12}}>
-          <button className="primary" onClick={() => void addUser()}>
+          <button className="primary" disabled={busy} onClick={() => void addUser()}>
             Save user
           </button>
         </div>
@@ -413,6 +508,10 @@ function UsersShiftsPanel({
 
       <div className="card">
         <h2>Assign shifts</h2>
+        <p className="muted">
+          Replaces all schedules for the selected user, then creates the next N days at the site
+          timezone.
+        </p>
         <div className="grid two">
           <label>
             User
@@ -429,7 +528,7 @@ function UsersShiftsPanel({
             <select value={assignLocation} onChange={e => setAssignLocation(e.target.value)}>
               {locations.map(l => (
                 <option key={l.id} value={l.id}>
-                  {l.name} ({l.id})
+                  {l.name} ({l.timezone || 'TZ?'})
                 </option>
               ))}
             </select>
@@ -454,8 +553,11 @@ function UsersShiftsPanel({
           </label>
         </div>
         <div className="row" style={{marginTop: 12}}>
-          <button className="primary" onClick={() => void assignShifts()}>
-            Replace schedules for user
+          <button className="primary" disabled={busy} onClick={() => void assignShifts()}>
+            {busy ? 'Saving…' : 'Replace schedules for user'}
+          </button>
+          <button className="ghost" onClick={() => void load()}>
+            Refresh
           </button>
         </div>
       </div>
@@ -487,7 +589,7 @@ function UsersShiftsPanel({
   );
 }
 
-/** Rough wall-clock → ISO for common demo timezones. Prefer SQL seeds for production accuracy. */
+/** Wall-clock → ISO using fixed offsets for demo timezones. */
 function wallToApproxIso(date: string, hm: string, tz: string): string {
   const offsets: Record<string, string> = {
     'Asia/Karachi': '+05:00',
@@ -497,7 +599,7 @@ function wallToApproxIso(date: string, hm: string, tz: string): string {
     UTC: 'Z',
   };
   const off = offsets[tz] || '+05:00';
-  const stamp = `${date}T${hm.length === 5 ? hm : hm}:00${off === 'Z' ? 'Z' : off}`;
+  const stamp = `${date}T${hm}:00${off === 'Z' ? 'Z' : off}`;
   return new Date(stamp).toISOString();
 }
 
@@ -509,26 +611,36 @@ function AttendancePanel({
   onError: (msg: string | null) => void;
 }) {
   const [rows, setRows] = useState<AttendanceRow[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    setBusy(true);
+    const {data, error} = await client
+      .from('attendance_logs')
+      .select('id,user_id,check_in_time,check_out_time,status,wifi_ssid,latitude,longitude')
+      .order('check_in_time', {ascending: false})
+      .limit(30);
+    setBusy(false);
+    if (error) {
+      onError(`Could not load attendance: ${error.message}`);
+      return;
+    }
+    onError(null);
+    setRows((data as AttendanceRow[]) || []);
+  }
 
   useEffect(() => {
-    void (async () => {
-      const {data, error} = await client
-        .from('attendance_logs')
-        .select('id,user_id,check_in_time,check_out_time,status,wifi_ssid,latitude,longitude')
-        .order('check_in_time', {ascending: false})
-        .limit(30);
-      if (error) {
-        onError(error.message);
-        return;
-      }
-      onError(null);
-      setRows((data as AttendanceRow[]) || []);
-    })();
+    void load();
   }, [client]);
 
   return (
     <div className="card">
-      <h2>Recent attendance (plain English)</h2>
+      <div className="row" style={{justifyContent: 'space-between'}}>
+        <h2 style={{margin: 0}}>Recent attendance</h2>
+        <button className="ghost" disabled={busy} onClick={() => void load()}>
+          {busy ? 'Loading…' : 'Refresh'}
+        </button>
+      </div>
       <table className="table">
         <thead>
           <tr>
@@ -561,40 +673,28 @@ function AttendancePanel({
   );
 }
 
-function FailuresPanel() {
-  return (
-    <div className="card">
-      <h2>Failure log</h2>
-      <p>
-        Next step: store auto/manual denial reasons (too early, outside GPS, biometric cancel, etc.)
-        into a Supabase table from the app, then show them here in plain English.
-      </p>
-      <p className="muted">
-        Until that table exists, use device logs tagged <code>BURQORA_BG_AUTO_CLOCKIN_SKIPPED</code>{' '}
-        and <code>ATT_CHECKIN_DENIED</code>.
-      </p>
-    </div>
-  );
-}
-
 function TestsPanel() {
   const checks = useMemo(
     () => [
       {
-        name: 'Manual check-in after shift end',
-        how: 'At the site after scheduled end → Check In Manually should succeed; timer starts from now.',
+        name: 'Auto clock-in',
+        how: 'Be at the scheduled site during the shift window with the app closed or backgrounded. Confirm attendance appears without opening the app (or shortly after).',
       },
       {
-        name: 'Manual after auto miss',
-        how: 'Stay on site without opening app until after shift start, then open and use Check In Manually.',
+        name: 'Manual clock-in fallback',
+        how: 'If auto misses, open Home → Check In Manually (Face ID). Works on site even after scheduled shift end.',
       },
       {
-        name: 'Too early still blocked',
-        how: 'More than 8 minutes before shift → manual should still say too early.',
+        name: 'Auto clock-out when leaving',
+        how: 'Stay clocked in, leave the site (~200–300m+). Expect auto clock-out about 30 seconds after confirmed exit.',
       },
       {
-        name: 'Multi-user isolation',
-        how: 'Assign user-1 and user-2 different sites/shifts; each device should only see its own schedule.',
+        name: 'Dashboard location edit',
+        how: 'Change a site GPS on Locations, save, refresh the app schedule, then retest clock-in at the new point.',
+      },
+      {
+        name: 'Dashboard shift assign',
+        how: 'Assign user-1 a short shift for today, refresh the app, confirm the new hours show on Home.',
       },
     ],
     [],
@@ -602,10 +702,7 @@ function TestsPanel() {
 
   return (
     <div className="card">
-      <h2>Manual test checklist</h2>
-      <p className="muted">
-        Automated device runners come next. For now, run these scenarios and compare with Attendance.
-      </p>
+      <h2>Client test checklist</h2>
       <table className="table">
         <thead>
           <tr>
