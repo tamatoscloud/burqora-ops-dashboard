@@ -2,7 +2,7 @@ import {useEffect, useMemo, useState} from 'react';
 import type {SupabaseClient} from '@supabase/supabase-js';
 import {createOpsClient, OPS_PIN} from './supabase';
 
-type Tab = 'overview' | 'locations' | 'users' | 'attendance' | 'tests';
+type Tab = 'overview' | 'locations' | 'users' | 'attendance' | 'logs' | 'tests';
 
 type LocationRow = {
   id: string;
@@ -33,6 +33,19 @@ type AttendanceRow = {
   longitude: number | null;
 };
 
+type OpsEventRow = {
+  id: string;
+  user_id: string | null;
+  level: 'success' | 'failure' | 'error' | 'info' | string;
+  category: string;
+  code: string | null;
+  message: string;
+  source: string | null;
+  details: Record<string, unknown> | null;
+  device_id: string | null;
+  created_at: string;
+};
+
 function plainTime(iso: string | null): string {
   if (!iso) return '—';
   try {
@@ -44,6 +57,78 @@ function plainTime(iso: string | null): string {
 
 function isValidHm(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value.trim());
+}
+
+/** Bump ops_user_sync so the app drops cache and reloads schedules/locations. */
+async function bumpOpsUserRevision(
+  client: SupabaseClient,
+  userId: string,
+): Promise<number | null> {
+  const {data: existing} = await client
+    .from('ops_user_sync')
+    .select('schedule_revision')
+    .eq('user_id', userId)
+    .maybeSingle();
+  const next = Number((existing as {schedule_revision?: number} | null)?.schedule_revision || 0) + 1;
+  const {error} = await client.from('ops_user_sync').upsert({
+    user_id: userId,
+    schedule_revision: next,
+    updated_at: new Date().toISOString(),
+  });
+  if (error) {
+    console.warn('[ops] bump revision failed', error.message);
+    return null;
+  }
+  return next;
+}
+
+/** Hard demo reset: wipe attendance, shift sessions/audit, and live logs for one user. */
+async function hardResetUserDemoData(
+  client: SupabaseClient,
+  userId: string,
+): Promise<{error: string | null}> {
+  // AC-1.1 / BUR-15: close open attendance before wiping so replace never orphans an active session.
+  const nowIso = new Date().toISOString();
+  const {error: closeLogsErr} = await client
+    .from('attendance_logs')
+    .update({
+      check_out_time: nowIso,
+      status: 'checked_out',
+    })
+    .eq('user_id', userId)
+    .is('check_out_time', null);
+  if (closeLogsErr) {
+    return {error: `attendance_logs close: ${closeLogsErr.message}`};
+  }
+
+  const {error: closeSessionsErr} = await client
+    .from('shift_sessions')
+    .update({
+      check_out_time: nowIso,
+      state: 'COMPLETED',
+      forced_closed_at: nowIso,
+      updated_at: nowIso,
+    })
+    .eq('user_id', userId)
+    .is('check_out_time', null);
+  if (closeSessionsErr) {
+    // Non-fatal if enum/state differs — continue to delete wipe.
+    console.warn('shift_sessions close skipped:', closeSessionsErr.message);
+  }
+
+  const tables = [
+    'shift_audit_events',
+    'shift_sessions',
+    'attendance_logs',
+    'ops_event_logs',
+  ] as const;
+  for (const table of tables) {
+    const {error} = await client.from(table).delete().eq('user_id', userId);
+    if (error) {
+      return {error: `${table}: ${error.message}`};
+    }
+  }
+  return {error: null};
 }
 
 export default function App() {
@@ -112,6 +197,7 @@ export default function App() {
             ['locations', 'Locations'],
             ['users', 'Users & shifts'],
             ['attendance', 'Attendance'],
+            ['logs', 'Live logs'],
             ['tests', 'Test checklist'],
           ] as const
         ).map(([id, label]) => (
@@ -134,6 +220,9 @@ export default function App() {
       {client && tab === 'attendance' ? (
         <AttendancePanel client={client} onError={setError} />
       ) : null}
+      {client && tab === 'logs' ? (
+        <LiveLogsPanel client={client} onError={setError} />
+      ) : null}
       {tab === 'tests' ? <TestsPanel /> : null}
     </div>
   );
@@ -149,11 +238,16 @@ function OverviewPanel({onGo}: {onGo: (tab: Tab) => void}) {
           without editing the database.
         </li>
         <li>
-          <strong>Users & shifts</strong> — add demo users (`user-1`, `user-2`, …) and assign daily
-          shifts to a location/timezone.
+          <strong>Users & shifts</strong> — hard-resets that user’s demo attendance + logs, then
+          assigns new shifts. Prefer <em>Marietta</em> or <em>Head Office</em> (Ohio GPS) for US
+          testing — do not assign Karachi sites for Ohio devices.
         </li>
         <li>
           <strong>Attendance</strong> — see who is clocked in / out in plain English.
+        </li>
+        <li>
+          <strong>Live logs</strong> — success / failure / error events from the app so you can
+          see exactly where something broke (check-in, check-out, schedule retry, etc.).
         </li>
         <li>
           <strong>Test checklist</strong> — step-by-step scenarios for the mobile app.
@@ -172,6 +266,9 @@ function OverviewPanel({onGo}: {onGo: (tab: Tab) => void}) {
         </button>
         <button className="ghost" onClick={() => onGo('attendance')}>
           View attendance
+        </button>
+        <button className="ghost" onClick={() => onGo('logs')}>
+          Live logs
         </button>
       </div>
     </div>
@@ -233,7 +330,14 @@ function LocationsPanel({
       onError('Save failed: no row updated (check location id / permissions).');
       return;
     }
-    onNotice(`Saved location “${editing.name}”. Pull-to-refresh schedules in the app.`);
+    onNotice(
+      `Saved location “${editing.name}”. Sync revision bumped — open/refresh the app to load new GPS.`,
+    );
+    // Notify all demo users that location config changed.
+    const {data: userRows} = await client.from('users').select('id');
+    for (const u of userRows || []) {
+      await bumpOpsUserRevision(client, String((u as {id: string}).id));
+    }
     setEditing(null);
     await load();
   }
@@ -364,10 +468,10 @@ function UsersShiftsPanel({
   const [newUserId, setNewUserId] = useState('user-2');
   const [newPhone, setNewPhone] = useState('+10000000002');
   const [assignUser, setAssignUser] = useState('user-1');
-  const [assignLocation, setAssignLocation] = useState('loc-tamatos-gulberg');
-  const [startLocal, setStartLocal] = useState('17:00');
-  const [endLocal, setEndLocal] = useState('21:00');
-  const [days, setDays] = useState(7);
+  const [assignLocation, setAssignLocation] = useState('loc-marietta-oh');
+  const [startLocal, setStartLocal] = useState('10:00');
+  const [endLocal, setEndLocal] = useState('19:00');
+  const [days, setDays] = useState(28);
   const [busy, setBusy] = useState(false);
 
   async function load() {
@@ -437,6 +541,16 @@ function UsersShiftsPanel({
     }
 
     setBusy(true);
+
+    // Hard demo reset (option B): wipe attendance + shift audit/sessions + live logs,
+    // then replace schedules and bump sync revision so the app clears local cache.
+    const reset = await hardResetUserDemoData(client, userId);
+    if (reset.error) {
+      setBusy(false);
+      onError(`Hard reset failed: ${reset.error}`);
+      return;
+    }
+
     const {error: delErr} = await client.from('schedules').delete().eq('user_id', userId);
     if (delErr) {
       setBusy(false);
@@ -473,13 +587,26 @@ function UsersShiftsPanel({
     }
 
     const {data, error} = await client.from('schedules').insert(rows).select('id');
-    setBusy(false);
     if (error) {
+      setBusy(false);
       onError(`Could not assign shifts: ${error.message}`);
       return;
     }
+
+    const revision = await bumpOpsUserRevision(client, userId);
+    await client.from('ops_event_logs').insert({
+      user_id: userId,
+      level: 'info',
+      category: 'ops',
+      code: 'HARD_RESET_SCHEDULES',
+      message: `Hard reset + assigned ${data?.length ?? rows.length} day(s) at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz})`,
+      source: 'ops-dashboard',
+      details: {revision, location_id: assignLocation, days},
+    });
+
+    setBusy(false);
     onNotice(
-      `Assigned ${data?.length ?? rows.length} day(s) for ${userId} at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz}). Refresh the app schedule.`,
+      `Hard reset done for ${userId}: attendance + live logs cleared, ${data?.length ?? rows.length} new shift day(s) at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz}). App will auto-reload on next open/focus (revision ${revision ?? '?'}).`,
     );
     await load();
   }
@@ -509,8 +636,9 @@ function UsersShiftsPanel({
       <div className="card">
         <h2>Assign shifts</h2>
         <p className="muted">
-          Replaces all schedules for the selected user, then creates the next N days at the site
-          timezone.
+          <strong>Hard demo reset:</strong> replaces all schedules for the selected user and deletes
+          that user’s attendance history, shift sessions/audit, and live logs. Sync revision bumps so
+          the app clears local cache on next open/focus.
         </p>
         <div className="grid two">
           <label>
@@ -554,7 +682,7 @@ function UsersShiftsPanel({
         </div>
         <div className="row" style={{marginTop: 12}}>
           <button className="primary" disabled={busy} onClick={() => void assignShifts()}>
-            {busy ? 'Saving…' : 'Replace schedules for user'}
+            {busy ? 'Saving…' : 'Hard reset + assign shifts'}
           </button>
           <button className="ghost" onClick={() => void load()}>
             Refresh
@@ -667,6 +795,136 @@ function AttendancePanel({
               </tr>
             );
           })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function LiveLogsPanel({
+  client,
+  onError,
+}: {
+  client: SupabaseClient;
+  onError: (msg: string | null) => void;
+}) {
+  const [rows, setRows] = useState<OpsEventRow[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [levelFilter, setLevelFilter] = useState<'all' | 'success' | 'failure' | 'error' | 'info'>(
+    'all',
+  );
+  const [autoRefresh, setAutoRefresh] = useState(true);
+
+  async function load() {
+    setBusy(true);
+    let q = client
+      .from('ops_event_logs')
+      .select('id,user_id,level,category,code,message,source,details,device_id,created_at')
+      .order('created_at', {ascending: false})
+      .limit(80);
+    if (levelFilter !== 'all') {
+      q = q.eq('level', levelFilter);
+    }
+    const {data, error} = await q;
+    setBusy(false);
+    if (error) {
+      onError(`Could not load live logs: ${error.message}`);
+      return;
+    }
+    onError(null);
+    setRows((data as OpsEventRow[]) || []);
+  }
+
+  useEffect(() => {
+    void load();
+  }, [client, levelFilter]);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const id = window.setInterval(() => void load(), 8_000);
+    return () => window.clearInterval(id);
+  }, [autoRefresh, client, levelFilter]);
+
+  return (
+    <div className="card">
+      <div className="row" style={{justifyContent: 'space-between', marginBottom: 8}}>
+        <div>
+          <h2 style={{margin: 0}}>Live app logs</h2>
+          <p className="muted" style={{margin: '6px 0 0'}}>
+            Success, failure, and error events from the phone app (check-in, check-out, schedule
+            retries). Use this to jump straight to the failing step.
+          </p>
+        </div>
+        <div className="row">
+          <label style={{margin: 0}}>
+            Level
+            <select
+              value={levelFilter}
+              onChange={e => setLevelFilter(e.target.value as typeof levelFilter)}
+              style={{minWidth: 120}}>
+              <option value="all">All</option>
+              <option value="error">Errors</option>
+              <option value="failure">Failures</option>
+              <option value="success">Success</option>
+              <option value="info">Info</option>
+            </select>
+          </label>
+          <label className="row" style={{gap: 6, margin: 0, color: 'var(--ink)'}}>
+            <input
+              type="checkbox"
+              checked={autoRefresh}
+              onChange={e => setAutoRefresh(e.target.checked)}
+              style={{width: 'auto'}}
+            />
+            Auto-refresh
+          </label>
+          <button className="ghost" disabled={busy} onClick={() => void load()}>
+            {busy ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+      <table className="table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Level</th>
+            <th>Category</th>
+            <th>Code</th>
+            <th>What happened</th>
+            <th>User</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan={7} className="muted">
+                No events yet. After the client installs the new APK and clocks in/out (or hits an
+                error), rows appear here within a few seconds.
+              </td>
+            </tr>
+          ) : (
+            rows.map(r => (
+              <tr key={r.id}>
+                <td>{plainTime(r.created_at)}</td>
+                <td>
+                  <span className={`log-pill log-${r.level}`}>{r.level}</span>
+                </td>
+                <td>{r.category}</td>
+                <td>
+                  <code>{r.code || '—'}</code>
+                </td>
+                <td>
+                  <div>{r.message}</div>
+                  {r.details && Object.keys(r.details).length > 0 ? (
+                    <pre className="log-details">{JSON.stringify(r.details, null, 0)}</pre>
+                  ) : null}
+                </td>
+                <td>{r.user_id || '—'}</td>
+                <td>{r.source || '—'}</td>
+              </tr>
+            ))
+          )}
         </tbody>
       </table>
     </div>
