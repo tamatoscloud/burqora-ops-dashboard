@@ -636,9 +636,9 @@ function UsersShiftsPanel({
       <div className="card">
         <h2>Assign shifts</h2>
         <p className="muted">
-          <strong>Hard demo reset:</strong> replaces all schedules for the selected user and deletes
-          that user’s attendance history, shift sessions/audit, and live logs. Sync revision bumps so
-          the app clears local cache on next open/focus.
+          <strong>Hard demo reset:</strong> closes any open session, deletes that user’s attendance / shift / audit /
+          live logs (so same-day reschedule does not leave stale clock-in blockers), replaces all schedules, and bumps
+          sync revision so the app clears local cache on next open/focus.
         </p>
         <div className="grid two">
           <label>
