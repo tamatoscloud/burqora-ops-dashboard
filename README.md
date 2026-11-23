@@ -22,6 +22,21 @@ Migration 022 removes the anon write access the old PIN dashboard used, so ship 
    every save fails.
 3. Remove the `VITE_OPS_PIN` env var from Vercel; it is no longer used.
 
+## Locking app data to activated phones (BUR-17)
+
+Migration 023 limits the mobile app's key to the rows of the employee whose **activated** phone sent
+the request. Until it is switched on, the database behaves as before, so phones on older builds keep
+working.
+
+1. Apply migration `023_device_scoped_rls.sql` (app repo `supabase/migrations/`). Nothing changes for users yet.
+2. Ship the app build that sends the install headers (every Supabase request), and wait until every
+   employee has updated.
+3. **Devices** tab → **Lock data to activated phones** (admins only). From then on:
+   - each phone sees only its own employee's shifts, attendance, profile and push tokens;
+   - a phone that is pending, revoked or on an old build sees no employee data;
+   - nobody can delete attendance through the app key.
+4. If something goes wrong, **Unlock data access** restores the previous behaviour immediately.
+
 ## Giving someone ops access
 
 1. Supabase → Authentication → Users → **Add user** (email + password).

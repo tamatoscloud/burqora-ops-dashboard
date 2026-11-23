@@ -928,6 +928,8 @@ type DeviceRow = {
 
 type DeviceSettings = {
   enforce_attendance: boolean;
+  /** BUR-17 (migration 023). Undefined while the database is still on 022. */
+  enforce_data_access?: boolean;
   auto_activate_first_device: boolean;
   self_activation_enabled: boolean;
   self_activation_code: string | null;
@@ -936,7 +938,7 @@ type DeviceSettings = {
 };
 
 /** BUR-38 + BUR-18: approve / reset employee phones; admins control enforcement and the code. */
-function DevicesPanel({
+export function DevicesPanel({
   client,
   identity,
   onError,
@@ -999,15 +1001,33 @@ function DevicesPanel({
     await load();
   }
 
-  async function saveSettings(patch: {enforce?: boolean; selfActivation?: boolean; code?: string}) {
+  async function saveSettings(patch: {
+    enforce?: boolean;
+    selfActivation?: boolean;
+    code?: string;
+    dataAccess?: boolean;
+  }) {
     if (patch.enforce === true && !window.confirm('Turn on enforcement? Attendance from unapproved phones will be rejected.')) {
       return;
     }
-    const {data, error} = await client.rpc('ops_set_device_binding_settings', {
+    if (
+      patch.dataAccess === true &&
+      !window.confirm(
+        'Lock data to activated phones? Phones on an older app build, or not yet activated, will stop seeing their shifts and attendance.',
+      )
+    ) {
+      return;
+    }
+    const args: Record<string, unknown> = {
       p_enforce_attendance: patch.enforce ?? null,
       p_self_activation_enabled: patch.selfActivation ?? null,
       p_self_activation_code: patch.code ?? null,
-    });
+    };
+    // Only sent when used, so this dashboard still works against a database without migration 023.
+    if (patch.dataAccess !== undefined) {
+      args.p_enforce_data_access = patch.dataAccess;
+    }
+    const {data, error} = await client.rpc('ops_set_device_binding_settings', args);
     if (error) {
       onError(`Settings not saved: ${opsErrorMessage(error.message)}`);
       return;
@@ -1040,6 +1060,25 @@ function DevicesPanel({
                 </div>
               ) : null}
             </div>
+            {settings.enforce_data_access !== undefined ? (
+              <div>
+                <strong>Data access:</strong>{' '}
+                {settings.enforce_data_access ? (
+                  <span className="err">LOCKED — each phone sees only its own employee’s data</span>
+                ) : (
+                  <span className="muted">Open — turn on once every phone runs the new app build</span>
+                )}
+                {isAdmin ? (
+                  <div className="row" style={{marginTop: 8}}>
+                    <button
+                      className="ghost"
+                      onClick={() => void saveSettings({dataAccess: !settings.enforce_data_access})}>
+                      {settings.enforce_data_access ? 'Unlock data access' : 'Lock data to activated phones'}
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             <div>
               <strong>New phone activation by code:</strong>{' '}
               {settings.self_activation_enabled ? 'allowed' : 'off — ops approval only'}
