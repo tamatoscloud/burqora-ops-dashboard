@@ -1,8 +1,8 @@
 import {useEffect, useMemo, useState} from 'react';
-import type {SupabaseClient} from '@supabase/supabase-js';
-import {createOpsClient, OPS_PIN} from './supabase';
+import type {Session, SupabaseClient} from '@supabase/supabase-js';
+import {createOpsClient, opsErrorMessage, type OpsIdentity} from './supabase';
 
-type Tab = 'overview' | 'locations' | 'users' | 'attendance' | 'logs' | 'tests';
+type Tab = 'overview' | 'locations' | 'users' | 'devices' | 'attendance' | 'logs' | 'tests';
 
 type LocationRow = {
   id: string;
@@ -59,123 +59,66 @@ function isValidHm(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value.trim());
 }
 
-/** Bump ops_user_sync so the app drops cache and reloads schedules/locations. */
-async function bumpOpsUserRevision(
-  client: SupabaseClient,
-  userId: string,
-): Promise<number | null> {
-  const {data: existing} = await client
-    .from('ops_user_sync')
-    .select('schedule_revision')
-    .eq('user_id', userId)
-    .maybeSingle();
-  const next = Number((existing as {schedule_revision?: number} | null)?.schedule_revision || 0) + 1;
-  const {error} = await client.from('ops_user_sync').upsert({
-    user_id: userId,
-    schedule_revision: next,
-    updated_at: new Date().toISOString(),
-  });
-  if (error) {
-    console.warn('[ops] bump revision failed', error.message);
-    return null;
-  }
-  return next;
-}
-
-/** Hard demo reset: wipe attendance, shift sessions/audit, and live logs for one user. */
-async function hardResetUserDemoData(
-  client: SupabaseClient,
-  userId: string,
-): Promise<{error: string | null}> {
-  // AC-1.1 / BUR-15: close open attendance before wiping so replace never orphans an active session.
-  const nowIso = new Date().toISOString();
-  const {error: closeLogsErr} = await client
-    .from('attendance_logs')
-    .update({
-      check_out_time: nowIso,
-      status: 'checked_out',
-    })
-    .eq('user_id', userId)
-    .is('check_out_time', null);
-  if (closeLogsErr) {
-    return {error: `attendance_logs close: ${closeLogsErr.message}`};
-  }
-
-  const {error: closeSessionsErr} = await client
-    .from('shift_sessions')
-    .update({
-      check_out_time: nowIso,
-      state: 'COMPLETED',
-      forced_closed_at: nowIso,
-      updated_at: nowIso,
-    })
-    .eq('user_id', userId)
-    .is('check_out_time', null);
-  if (closeSessionsErr) {
-    // Non-fatal if enum/state differs — continue to delete wipe.
-    console.warn('shift_sessions close skipped:', closeSessionsErr.message);
-  }
-
-  const tables = [
-    'shift_audit_events',
-    'shift_sessions',
-    'attendance_logs',
-    'ops_event_logs',
-  ] as const;
-  for (const table of tables) {
-    const {error} = await client.from(table).delete().eq('user_id', userId);
-    if (error) {
-      return {error: `${table}: ${error.message}`};
-    }
-  }
-  return {error: null};
-}
-
 export default function App() {
-  const [unlocked, setUnlocked] = useState(false);
-  const [pin, setPin] = useState('');
   const [tab, setTab] = useState<Tab>('overview');
   const [client, setClient] = useState<SupabaseClient | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [identity, setIdentity] = useState<OpsIdentity | null>(null);
+  const [checking, setChecking] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!unlocked) return;
     try {
-      setClient(createOpsClient());
-      setError(null);
+      const c = createOpsClient();
+      setClient(c);
+      void c.auth.getSession().then(({data}) => setSession(data.session));
+      const {data: sub} = c.auth.onAuthStateChange((_event, s) => setSession(s));
+      return () => sub.subscription.unsubscribe();
     } catch (e) {
       setError((e as Error).message);
+      setChecking(false);
     }
-  }, [unlocked]);
+  }, []);
+
+  // BUR-18: signed in is not enough — the account must be an active ops user.
+  useEffect(() => {
+    if (!client) return;
+    if (!session) {
+      setIdentity(null);
+      setChecking(false);
+      return;
+    }
+    setChecking(true);
+    void client.rpc('ops_whoami').then(({data, error: err}) => {
+      setIdentity(err ? null : ((data as OpsIdentity | null) ?? null));
+      setChecking(false);
+    });
+  }, [client, session]);
 
   useEffect(() => {
     setNotice(null);
     setError(null);
   }, [tab]);
 
-  if (!unlocked) {
+  if (!client || checking) {
+    return <div className="app pin-gate card">{error ? <div className="err">{error}</div> : 'Loading…'}</div>;
+  }
+
+  if (!session) {
+    return <LoginPanel client={client} />;
+  }
+
+  if (!identity) {
     return (
       <div className="app pin-gate card">
         <h1>BurqOra Ops</h1>
-        <p className="muted">Enter the ops PIN to continue (default: burqora-ops).</p>
-        <div className="grid" style={{marginTop: 16}}>
-          <label>
-            PIN
-            <input
-              type="password"
-              value={pin}
-              onChange={e => setPin(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && pin === OPS_PIN) setUnlocked(true);
-              }}
-            />
-          </label>
-          <button className="primary" onClick={() => setUnlocked(pin === OPS_PIN)}>
-            Unlock
-          </button>
-          {pin && pin !== OPS_PIN ? <div className="err">Wrong PIN</div> : null}
-        </div>
+        <p className="err">
+          {session.user.email} is signed in but does not have ops access. Ask an admin to grant it.
+        </p>
+        <button className="ghost" onClick={() => void client.auth.signOut()}>
+          Sign out
+        </button>
       </div>
     );
   }
@@ -185,6 +128,14 @@ export default function App() {
       <header>
         <h1>BurqOra Ops Dashboard</h1>
         <p>Update locations, assign shifts, and review attendance in plain language.</p>
+        <div className="row">
+          <span className="muted">
+            Signed in as {identity.email} ({identity.role})
+          </span>
+          <button className="ghost" onClick={() => void client.auth.signOut()}>
+            Sign out
+          </button>
+        </div>
       </header>
 
       {error ? <div className="banner error">{error}</div> : null}
@@ -196,6 +147,7 @@ export default function App() {
             ['overview', 'Overview'],
             ['locations', 'Locations'],
             ['users', 'Users & shifts'],
+            ['devices', 'Devices'],
             ['attendance', 'Attendance'],
             ['logs', 'Live logs'],
             ['tests', 'Test checklist'],
@@ -216,6 +168,9 @@ export default function App() {
       ) : null}
       {client && tab === 'users' ? (
         <UsersShiftsPanel client={client} onError={setError} onNotice={setNotice} />
+      ) : null}
+      {client && tab === 'devices' ? (
+        <DevicesPanel client={client} identity={identity} onError={setError} onNotice={setNotice} />
       ) : null}
       {client && tab === 'attendance' ? (
         <AttendancePanel client={client} onError={setError} />
@@ -243,6 +198,10 @@ function OverviewPanel({onGo}: {onGo: (tab: Tab) => void}) {
           testing — do not assign Karachi sites for Ohio devices.
         </li>
         <li>
+          <strong>Devices</strong> — approve an employee's new phone, reset lost phones, and (admins)
+          control device enforcement and the activation code.
+        </li>
+        <li>
           <strong>Attendance</strong> — see who is clocked in / out in plain English.
         </li>
         <li>
@@ -254,8 +213,8 @@ function OverviewPanel({onGo}: {onGo: (tab: Tab) => void}) {
         </li>
       </ol>
       <p className="muted">
-        This dashboard is for the client demo (mock auth). Use the same user id in the app after OTP
-        (any 6-digit code in demo builds).
+        Every change is made by a server function that checks your ops login and records who did it
+        in Live logs.
       </p>
       <div className="row" style={{marginTop: 12}}>
         <button className="primary" onClick={() => onGo('locations')}>
@@ -308,36 +267,24 @@ function LocationsPanel({
   async function save() {
     if (!editing) return;
     setBusy(true);
-    const {data, error} = await client
-      .from('locations')
-      .update({
-        name: editing.name,
-        latitude: Number(editing.latitude),
-        longitude: Number(editing.longitude),
-        radius: Number(editing.radius ?? 200),
-        wifi_ssid: editing.wifi_ssid,
-        timezone: editing.timezone || 'Asia/Karachi',
-      })
-      .eq('id', editing.id)
-      .select('id,name')
-      .maybeSingle();
+    const {data, error} = await client.rpc('ops_update_location', {
+      p_id: editing.id,
+      p_name: editing.name,
+      p_latitude: Number(editing.latitude),
+      p_longitude: Number(editing.longitude),
+      p_radius: Number(editing.radius ?? 200),
+      p_wifi_ssid: editing.wifi_ssid,
+      p_timezone: editing.timezone || 'Asia/Karachi',
+    });
     setBusy(false);
     if (error) {
-      onError(`Save failed: ${error.message}`);
+      onError(`Save failed: ${opsErrorMessage(error.message)}`);
       return;
     }
-    if (!data) {
-      onError('Save failed: no row updated (check location id / permissions).');
-      return;
-    }
+    const notified = (data as {users_notified?: number} | null)?.users_notified ?? 0;
     onNotice(
-      `Saved location “${editing.name}”. Sync revision bumped — open/refresh the app to load new GPS.`,
+      `Saved location “${editing.name}”. ${notified} user(s) will reload the new GPS on next app open.`,
     );
-    // Notify all demo users that location config changed.
-    const {data: userRows} = await client.from('users').select('id');
-    for (const u of userRows || []) {
-      await bumpOpsUserRevision(client, String((u as {id: string}).id));
-    }
     setEditing(null);
     await load();
   }
@@ -510,10 +457,10 @@ function UsersShiftsPanel({
     const id = newUserId.trim();
     if (!id) return;
     setBusy(true);
-    const {error} = await client.from('users').upsert({id, phone: newPhone.trim() || null});
+    const {error} = await client.rpc('ops_upsert_user', {p_user_id: id, p_phone: newPhone.trim() || null});
     setBusy(false);
     if (error) {
-      onError(`Could not save user: ${error.message}`);
+      onError(`Could not save user: ${opsErrorMessage(error.message)}`);
       return;
     }
     onNotice(
@@ -541,22 +488,6 @@ function UsersShiftsPanel({
     }
 
     setBusy(true);
-
-    // Hard demo reset (option B): wipe attendance + shift audit/sessions + live logs,
-    // then replace schedules and bump sync revision so the app clears local cache.
-    const reset = await hardResetUserDemoData(client, userId);
-    if (reset.error) {
-      setBusy(false);
-      onError(`Hard reset failed: ${reset.error}`);
-      return;
-    }
-
-    const {error: delErr} = await client.from('schedules').delete().eq('user_id', userId);
-    if (delErr) {
-      setBusy(false);
-      onError(`Could not clear old schedules: ${delErr.message}`);
-      return;
-    }
 
     const rows: Array<{user_id: string; location_id: string; start_time: string; end_time: string}> =
       [];
@@ -586,27 +517,24 @@ function UsersShiftsPanel({
       void day;
     }
 
-    const {data, error} = await client.from('schedules').insert(rows).select('id');
+    // BUR-18: one server call — wipe the user's attendance + logs and replace schedules
+    // atomically, as the signed-in ops account (audited).
+    const {data, error} = await client.rpc('ops_hard_reset_and_assign', {
+      p_user_id: userId,
+      p_location_id: assignLocation,
+      p_shifts: rows.map(r => ({start_time: r.start_time, end_time: r.end_time})),
+      p_reason: `${loc?.name || assignLocation} ${startLocal}–${endLocal} ${tz}`,
+    });
     if (error) {
       setBusy(false);
-      onError(`Could not assign shifts: ${error.message}`);
+      onError(`Hard reset failed: ${opsErrorMessage(error.message)}`);
       return;
     }
-
-    const revision = await bumpOpsUserRevision(client, userId);
-    await client.from('ops_event_logs').insert({
-      user_id: userId,
-      level: 'info',
-      category: 'ops',
-      code: 'HARD_RESET_SCHEDULES',
-      message: `Hard reset + assigned ${data?.length ?? rows.length} day(s) at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz})`,
-      source: 'ops-dashboard',
-      details: {revision, location_id: assignLocation, days},
-    });
-
+    const result = (data as {shifts?: number; revision?: number} | null) ?? {};
+    const revision = result.revision;
     setBusy(false);
     onNotice(
-      `Hard reset done for ${userId}: attendance + live logs cleared, ${data?.length ?? rows.length} new shift day(s) at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz}). App will auto-reload on next open/focus (revision ${revision ?? '?'}).`,
+      `Hard reset done for ${userId}: attendance + live logs cleared, ${result.shifts ?? rows.length} new shift day(s) at ${loc?.name || assignLocation} (${startLocal}–${endLocal} ${tz}). App will auto-reload on next open/focus (revision ${revision ?? '?'}).`,
     );
     await load();
   }
@@ -636,9 +564,9 @@ function UsersShiftsPanel({
       <div className="card">
         <h2>Assign shifts</h2>
         <p className="muted">
-          <strong>Hard demo reset:</strong> closes any open session, deletes that user’s attendance / shift / audit /
-          live logs (so same-day reschedule does not leave stale clock-in blockers), replaces all schedules, and bumps
-          sync revision so the app clears local cache on next open/focus.
+          <strong>Hard demo reset:</strong> deletes that user’s attendance / shift / audit / live logs,
+          including any open session (so same-day reschedule does not leave stale clock-in blockers),
+          replaces all schedules, and bumps sync revision so the app clears local cache on next open/focus.
         </p>
         <div className="grid two">
           <label>
@@ -980,5 +908,285 @@ function TestsPanel() {
         </tbody>
       </table>
     </div>
+  );
+}
+
+/** BUR-18: Supabase Auth sign-in for ops staff (replaces the browser-side PIN). */
+function LoginPanel({client}: {client: SupabaseClient}) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function signIn() {
+    setBusy(true);
+    setErr(null);
+    const {error} = await client.auth.signInWithPassword({email: email.trim(), password});
+    setBusy(false);
+    if (error) {
+      setErr(/invalid/i.test(error.message) ? 'Wrong email or password.' : error.message);
+    }
+  }
+
+  return (
+    <div className="app pin-gate card">
+      <h1>BurqOra Ops</h1>
+      <p className="muted">Sign in with your ops account.</p>
+      <div className="grid" style={{marginTop: 16}}>
+        <label>
+          Email
+          <input type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} />
+        </label>
+        <label>
+          Password
+          <input
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') void signIn();
+            }}
+          />
+        </label>
+        <button className="primary" disabled={busy || !email || !password} onClick={() => void signIn()}>
+          {busy ? 'Signing in…' : 'Sign in'}
+        </button>
+        {err ? <div className="err">{err}</div> : null}
+      </div>
+    </div>
+  );
+}
+
+type DeviceRow = {
+  id: string;
+  user_id: string;
+  install_id_prefix: string;
+  status: 'active' | 'pending' | 'revoked';
+  platform: string | null;
+  model: string | null;
+  app_version: string | null;
+  created_at: string;
+  activated_at: string | null;
+  revoked_at: string | null;
+  revoked_reason: string | null;
+  last_seen_at: string | null;
+};
+
+type DeviceSettings = {
+  enforce_attendance: boolean;
+  auto_activate_first_device: boolean;
+  self_activation_enabled: boolean;
+  self_activation_code: string | null;
+  updated_at: string | null;
+  updated_by: string | null;
+};
+
+/** BUR-38 + BUR-18: approve / reset employee phones; admins control enforcement and the code. */
+function DevicesPanel({
+  client,
+  identity,
+  onError,
+  onNotice,
+}: {
+  client: SupabaseClient;
+  identity: OpsIdentity;
+  onError: (msg: string | null) => void;
+  onNotice: (msg: string | null) => void;
+}) {
+  const [rows, setRows] = useState<DeviceRow[]>([]);
+  const [settings, setSettings] = useState<DeviceSettings | null>(null);
+  const [filter, setFilter] = useState<'all' | 'pending' | 'active' | 'revoked'>('all');
+  const [newCode, setNewCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const isAdmin = identity.role === 'admin';
+
+  async function load() {
+    setBusy(true);
+    const [list, conf] = await Promise.all([
+      client.rpc('ops_list_device_registrations', {p_status: filter === 'all' ? null : filter}),
+      client.rpc('ops_get_device_binding_settings'),
+    ]);
+    setBusy(false);
+    if (list.error || conf.error) {
+      onError(`Could not load devices: ${opsErrorMessage((list.error || conf.error)!.message)}`);
+      return;
+    }
+    onError(null);
+    setRows((list.data as DeviceRow[]) || []);
+    setSettings(conf.data as DeviceSettings);
+  }
+
+  useEffect(() => {
+    void load();
+  }, [client, filter]);
+
+  async function approve(row: DeviceRow) {
+    if (!window.confirm(`Approve this phone for ${row.user_id}? Their current phone will stop working for attendance.`)) {
+      return;
+    }
+    const {error} = await client.rpc('ops_activate_device', {p_registration_id: row.id, p_reason: 'ops_approval'});
+    if (error) {
+      onError(`Approve failed: ${opsErrorMessage(error.message)}`);
+      return;
+    }
+    onNotice(`Phone approved for ${row.user_id}.`);
+    await load();
+  }
+
+  async function resetUser(userId: string) {
+    const reason = window.prompt(`Reset all phones for ${userId}? Enter a reason (e.g. lost phone):`);
+    if (!reason || !reason.trim()) return;
+    const {data, error} = await client.rpc('ops_reset_user_devices', {p_user_id: userId, p_reason: reason.trim()});
+    if (error) {
+      onError(`Reset failed: ${opsErrorMessage(error.message)}`);
+      return;
+    }
+    onNotice(`Reset ${data ?? 0} phone(s) for ${userId}. Their next login registers a new phone.`);
+    await load();
+  }
+
+  async function saveSettings(patch: {enforce?: boolean; selfActivation?: boolean; code?: string}) {
+    if (patch.enforce === true && !window.confirm('Turn on enforcement? Attendance from unapproved phones will be rejected.')) {
+      return;
+    }
+    const {data, error} = await client.rpc('ops_set_device_binding_settings', {
+      p_enforce_attendance: patch.enforce ?? null,
+      p_self_activation_enabled: patch.selfActivation ?? null,
+      p_self_activation_code: patch.code ?? null,
+    });
+    if (error) {
+      onError(`Settings not saved: ${opsErrorMessage(error.message)}`);
+      return;
+    }
+    setSettings(data as DeviceSettings);
+    setNewCode('');
+    onNotice('Device settings saved.');
+  }
+
+  const pendingCount = rows.filter(r => r.status === 'pending').length;
+
+  return (
+    <>
+      <div className="card">
+        <h2>Device rules</h2>
+        {settings ? (
+          <div className="grid two">
+            <div>
+              <strong>Enforcement:</strong>{' '}
+              {settings.enforce_attendance ? (
+                <span className="err">ON — unapproved phones are rejected</span>
+              ) : (
+                <span className="muted">Monitor only — violations are logged, not blocked</span>
+              )}
+              {isAdmin ? (
+                <div className="row" style={{marginTop: 8}}>
+                  <button className="ghost" onClick={() => void saveSettings({enforce: !settings.enforce_attendance})}>
+                    {settings.enforce_attendance ? 'Switch to monitor only' : 'Turn on enforcement'}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            <div>
+              <strong>New phone activation by code:</strong>{' '}
+              {settings.self_activation_enabled ? 'allowed' : 'off — ops approval only'}
+              {isAdmin ? (
+                <>
+                  <div className="muted">Current code: {settings.self_activation_code}</div>
+                  <div className="row" style={{marginTop: 8}}>
+                    <input
+                      placeholder="New 6-digit code"
+                      value={newCode}
+                      maxLength={8}
+                      onChange={e => setNewCode(e.target.value.replace(/[^0-9]/g, ''))}
+                    />
+                    <button className="ghost" disabled={newCode.length < 4} onClick={() => void saveSettings({code: newCode})}>
+                      Change code
+                    </button>
+                    <button
+                      className="ghost"
+                      onClick={() => void saveSettings({selfActivation: !settings.self_activation_enabled})}>
+                      {settings.self_activation_enabled ? 'Require ops approval' : 'Allow code activation'}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div className="muted">Only admins can change these rules.</div>
+              )}
+            </div>
+          </div>
+        ) : null}
+        {settings?.updated_by ? (
+          <p className="muted">
+            Last changed by {settings.updated_by} at {plainTime(settings.updated_at)}
+          </p>
+        ) : null}
+      </div>
+
+      <div className="card">
+        <div className="row">
+          <h2>Phones{pendingCount ? ` — ${pendingCount} waiting for approval` : ''}</h2>
+          <select value={filter} onChange={e => setFilter(e.target.value as typeof filter)}>
+            <option value="all">All</option>
+            <option value="pending">Waiting for approval</option>
+            <option value="active">Active</option>
+            <option value="revoked">Revoked</option>
+          </select>
+          <button className="ghost" disabled={busy} onClick={() => void load()}>
+            Refresh
+          </button>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Employee</th>
+              <th>Status</th>
+              <th>Phone</th>
+              <th>Registered</th>
+              <th>Last seen</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.id}>
+                <td>{r.user_id}</td>
+                <td>
+                  {r.status === 'pending' ? <strong>Waiting</strong> : r.status === 'active' ? <span className="ok">Active</span> : 'Revoked'}
+                  {r.revoked_reason ? <div className="muted">{r.revoked_reason}</div> : null}
+                </td>
+                <td>
+                  {[r.platform, r.model].filter(Boolean).join(' · ') || '—'}
+                  <div className="muted">id {r.install_id_prefix}… {r.app_version ? `· v${r.app_version}` : ''}</div>
+                </td>
+                <td>{plainTime(r.created_at)}</td>
+                <td>{plainTime(r.last_seen_at)}</td>
+                <td>
+                  <div className="row">
+                    {r.status === 'pending' ? (
+                      <button className="primary" onClick={() => void approve(r)}>
+                        Approve
+                      </button>
+                    ) : null}
+                    {r.status !== 'revoked' ? (
+                      <button className="ghost" onClick={() => void resetUser(r.user_id)}>
+                        Reset phones
+                      </button>
+                    ) : null}
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {!rows.length ? (
+              <tr>
+                <td colSpan={6} className="muted">
+                  No phones registered yet.
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
