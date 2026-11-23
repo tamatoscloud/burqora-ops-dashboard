@@ -1,6 +1,7 @@
 import {useEffect, useMemo, useState} from 'react';
 import type {Session, SupabaseClient} from '@supabase/supabase-js';
 import {createOpsClient, opsErrorMessage, type OpsIdentity} from './supabase';
+import {buildShiftDays} from './shifts';
 
 type Tab = 'overview' | 'locations' | 'users' | 'devices' | 'attendance' | 'logs' | 'tests';
 
@@ -53,10 +54,6 @@ function plainTime(iso: string | null): string {
   } catch {
     return iso;
   }
-}
-
-function isValidHm(value: string): boolean {
-  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value.trim());
 }
 
 export default function App() {
@@ -400,7 +397,7 @@ function LocationsPanel({
   );
 }
 
-function UsersShiftsPanel({
+export function UsersShiftsPanel({
   client,
   onError,
   onNotice,
@@ -478,51 +475,21 @@ function UsersShiftsPanel({
       onError('Pick a user and location first.');
       return;
     }
-    if (!isValidHm(startLocal) || !isValidHm(endLocal)) {
-      onError('Start/end must be HH:MM (24h), e.g. 17:00');
+    const built = buildShiftDays({now: new Date(), days, timeZone: tz, startHm: startLocal, endHm: endLocal});
+    if ('error' in built) {
+      onError(built.error);
       return;
     }
-    if (days < 1 || days > 28) {
-      onError('Days ahead must be between 1 and 28.');
-      return;
-    }
+    const rows = built.shifts;
 
     setBusy(true);
-
-    const rows: Array<{user_id: string; location_id: string; start_time: string; end_time: string}> =
-      [];
-    const now = new Date();
-    for (let i = 0; i < days; i++) {
-      const day = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() + i));
-      // Use calendar date in site TZ by formatting with Intl
-      const dayKey = new Intl.DateTimeFormat('en-CA', {
-        timeZone: tz,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }).format(new Date(now.getTime() + i * 24 * 60 * 60 * 1000));
-      const startIso = wallToApproxIso(dayKey, startLocal.trim(), tz);
-      const endIso = wallToApproxIso(dayKey, endLocal.trim(), tz);
-      if (Number.isNaN(Date.parse(startIso)) || Number.isNaN(Date.parse(endIso))) {
-        setBusy(false);
-        onError(`Invalid time conversion for ${dayKey} (${tz}).`);
-        return;
-      }
-      rows.push({
-        user_id: userId,
-        location_id: assignLocation,
-        start_time: startIso,
-        end_time: endIso,
-      });
-      void day;
-    }
 
     // BUR-18: one server call — wipe the user's attendance + logs and replace schedules
     // atomically, as the signed-in ops account (audited).
     const {data, error} = await client.rpc('ops_hard_reset_and_assign', {
       p_user_id: userId,
       p_location_id: assignLocation,
-      p_shifts: rows.map(r => ({start_time: r.start_time, end_time: r.end_time})),
+      p_shifts: rows,
       p_reason: `${loc?.name || assignLocation} ${startLocal}–${endLocal} ${tz}`,
     });
     if (error) {
@@ -645,21 +612,7 @@ function UsersShiftsPanel({
   );
 }
 
-/** Wall-clock → ISO using fixed offsets for demo timezones. */
-function wallToApproxIso(date: string, hm: string, tz: string): string {
-  const offsets: Record<string, string> = {
-    'Asia/Karachi': '+05:00',
-    'America/New_York': '-04:00',
-    'America/Chicago': '-05:00',
-    'Europe/London': '+01:00',
-    UTC: 'Z',
-  };
-  const off = offsets[tz] || '+05:00';
-  const stamp = `${date}T${hm}:00${off === 'Z' ? 'Z' : off}`;
-  return new Date(stamp).toISOString();
-}
-
-function AttendancePanel({
+export function AttendancePanel({
   client,
   onError,
 }: {
